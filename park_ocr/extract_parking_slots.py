@@ -45,12 +45,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cache-dir",
         default="park_ocr/.paddlex_cache",
-        help="Local cache directory for PaddleOCR models.",
+        help="Local cache directory for PaddleX models.",
     )
     parser.add_argument(
         "--lang",
         default="ch",
-        help="PaddleOCR language.",
+        help="OCR language hint (kept for compatibility; PaddleX OCR ignores this value).",
+    )
+    parser.add_argument(
+        "--device",
+        default="gpu",
+        help="PaddleX device string, e.g. 'gpu', 'gpu:0', or 'cpu'.",
+    )
+    parser.add_argument(
+        "--use-doc-preprocessor",
+        action="store_true",
+        default=None,
+        help="Enable document orientation/unwarping in PaddleX OCR pipeline.",
+    )
+    parser.add_argument(
+        "--disable-doc-preprocessor",
+        action="store_false",
+        dest="use_doc_preprocessor",
+        default=None,
+        help="Disable document orientation/unwarping in PaddleX OCR pipeline.",
+    )
+    parser.add_argument(
+        "--use-textline-orientation",
+        action="store_true",
+        default=None,
+        help="Enable textline orientation in PaddleX OCR pipeline.",
+    )
+    parser.add_argument(
+        "--disable-textline-orientation",
+        action="store_false",
+        dest="use_textline_orientation",
+        default=None,
+        help="Disable textline orientation in PaddleX OCR pipeline.",
     )
     parser.add_argument(
         "--min-score",
@@ -88,6 +119,18 @@ def parse_args() -> argparse.Namespace:
         default=2.2,
         help="Scale factor applied to each OCR tile before recognition.",
     )
+    parser.add_argument(
+        "--rotation-angles",
+        type=str,
+        default="0,-8,8",
+        help="Comma-separated rotation angles (degrees) applied per tile.",
+    )
+    parser.add_argument(
+        "--ocr-source",
+        choices=("cleaned", "original"),
+        default="cleaned",
+        help="Image source used for OCR tiles.",
+    )
     return parser.parse_args()
 
 
@@ -98,6 +141,68 @@ def configure_env(cache_dir: Path) -> None:
     os.environ["PADDLE_PDX_MODEL_SOURCE"] = "bos"
     os.environ["FLAGS_enable_pir_api"] = "0"
     os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "False"
+
+
+def parse_rotation_angles(value: str) -> list[float]:
+    angles: list[float] = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            angle = float(item)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"Invalid rotation angle: {item}"
+            ) from exc
+        if not any(abs(angle - existing) < 1e-6 for existing in angles):
+            angles.append(angle)
+    if not any(abs(angle) < 1e-6 for angle in angles):
+        angles.insert(0, 0.0)
+    return angles
+
+
+def rotate_with_inverse(image: np.ndarray, angle: float) -> tuple[np.ndarray, np.ndarray | None]:
+    if abs(angle) < 1e-6:
+        return image, None
+    height, width = image.shape[:2]
+    center = (width / 2.0, height / 2.0)
+    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(
+        image,
+        matrix,
+        (width, height),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    inverse = cv2.invertAffineTransform(matrix)
+    return rotated, inverse
+
+
+def apply_affine(points: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    ones = np.ones((points.shape[0], 1), dtype=points.dtype)
+    stacked = np.hstack([points, ones])
+    return stacked @ matrix.T
+
+
+def build_ocr_pipeline(
+    device: str,
+    use_doc_preprocessor: bool | None,
+    use_textline_orientation: bool | None,
+):
+    from paddlex import create_pipeline
+    from paddlex.inference import load_pipeline_config
+    from paddlex.inference.utils.pp_option import PaddlePredictorOption
+
+    config = load_pipeline_config("OCR")
+    if use_doc_preprocessor is not None:
+        config["use_doc_preprocessor"] = use_doc_preprocessor
+    if use_textline_orientation is not None:
+        config["use_textline_orientation"] = use_textline_orientation
+    pp_option = PaddlePredictorOption()
+    pp_option.enable_new_ir = False
+    pp_option.enable_cinn = False
+    return create_pipeline(config=config, device=device, pp_option=pp_option)
 
 
 def build_parking_mask(cleaned: np.ndarray) -> np.ndarray:
@@ -465,7 +570,7 @@ def should_keep_detection(
 
 def run_region_ocr(
     ocr,
-    cleaned: np.ndarray,
+    ocr_image: np.ndarray,
     region: RegionBox,
     min_score: float,
     tile_width: int,
@@ -473,10 +578,13 @@ def run_region_ocr(
     step_x: int,
     step_y: int,
     tile_scale: float,
+    use_doc_preprocessor: bool | None,
+    use_textline_orientation: bool | None,
+    rotation_angles: list[float],
 ) -> list[dict]:
     rows: list[dict] = []
     for tile in generate_tiles(region, tile_width, tile_height, step_x, step_y):
-        crop = cleaned[tile["top"] : tile["bottom"], tile["left"] : tile["right"]]
+        crop = ocr_image[tile["top"] : tile["bottom"], tile["left"] : tile["right"]]
         scaled = cv2.resize(
             crop,
             None,
@@ -484,31 +592,43 @@ def run_region_ocr(
             fy=tile_scale,
             interpolation=cv2.INTER_CUBIC,
         )
-        results = ocr.predict(scaled, text_det_limit_side_len=max(scaled.shape[:2]))
-        for box, text, score in iter_ocr_results(results):
-            quad = normalize_box(box) / tile_scale
-            quad[:, 0] += tile["left"]
-            quad[:, 1] += tile["top"]
-            bbox = quad_to_aabb(quad)
-            if not should_keep_detection(bbox, region, score, min_score):
-                continue
-
-            slot_numbers = expand_detected_text(text)
-            if not slot_numbers:
-                continue
-
-            for index, slot_number in enumerate(slot_numbers):
-                split_quad = split_quad_evenly(quad, len(slot_numbers), index)
-                rows.append(
-                    {
-                        "region_id": region.region_id,
-                        "slot_number": slot_number,
-                        "raw_text": text,
-                        "score": score,
-                        "quad": split_quad,
-                        "bbox": quad_to_aabb(split_quad),
-                    }
+        for angle in rotation_angles:
+            rotated, inverse = rotate_with_inverse(scaled, angle)
+            results = list(
+                ocr.predict(
+                    rotated,
+                    use_doc_orientation_classify=use_doc_preprocessor,
+                    use_doc_unwarping=use_doc_preprocessor,
+                    use_textline_orientation=use_textline_orientation,
                 )
+            )
+            for box, text, score in iter_ocr_results(results):
+                quad = normalize_box(box)
+                if inverse is not None:
+                    quad = apply_affine(quad, inverse)
+                quad = quad / tile_scale
+                quad[:, 0] += tile["left"]
+                quad[:, 1] += tile["top"]
+                bbox = quad_to_aabb(quad)
+                if not should_keep_detection(bbox, region, score, min_score):
+                    continue
+
+                slot_numbers = expand_detected_text(text)
+                if not slot_numbers:
+                    continue
+
+                for index, slot_number in enumerate(slot_numbers):
+                    split_quad = split_quad_evenly(quad, len(slot_numbers), index)
+                    rows.append(
+                        {
+                            "region_id": region.region_id,
+                            "slot_number": slot_number,
+                            "raw_text": text,
+                            "score": score,
+                            "quad": split_quad,
+                            "bbox": quad_to_aabb(split_quad),
+                        }
+                    )
     return rows
 
 
@@ -641,6 +761,7 @@ def save_slot_csv(path: Path, rows: list[dict]) -> None:
 
 def main() -> None:
     args = parse_args()
+    rotation_angles = parse_rotation_angles(args.rotation_angles)
     image_path = Path(args.image)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -663,26 +784,19 @@ def main() -> None:
     save_region_crops(original, region_crops_dir, regions)
 
     configure_env(Path(args.cache_dir))
-    from paddleocr import PaddleOCR
-
-    ocr = PaddleOCR(
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False,
-        lang=args.lang,
-        ocr_version="PP-OCRv4",
-        device="cpu",
-        enable_mkldnn=False,
-        enable_hpi=False,
-        cpu_threads=4,
+    ocr = build_ocr_pipeline(
+        device=args.device,
+        use_doc_preprocessor=args.use_doc_preprocessor,
+        use_textline_orientation=args.use_textline_orientation,
     )
 
     rows: list[dict] = []
+    ocr_image = cleaned if args.ocr_source == "cleaned" else original
     for region in regions:
         rows.extend(
             run_region_ocr(
                 ocr=ocr,
-                cleaned=cleaned,
+                ocr_image=ocr_image,
                 region=region,
                 min_score=args.min_score,
                 tile_width=args.tile_width,
@@ -690,6 +804,9 @@ def main() -> None:
                 step_x=args.tile_step_x,
                 step_y=args.tile_step_y,
                 tile_scale=args.tile_scale,
+                use_doc_preprocessor=args.use_doc_preprocessor,
+                use_textline_orientation=args.use_textline_orientation,
+                rotation_angles=rotation_angles,
             )
         )
 

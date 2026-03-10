@@ -24,12 +24,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cache-dir",
         default="park_ocr/.paddlex_cache",
-        help="Local cache dir for PaddleX/PaddleOCR models.",
+        help="Local cache dir for PaddleX models.",
     )
     parser.add_argument(
         "--lang",
         default="ch",
-        help="OCR language.",
+        help="OCR language hint (kept for compatibility; PaddleX OCR ignores this value).",
+    )
+    parser.add_argument(
+        "--device",
+        default="gpu",
+        help="PaddleX device string, e.g. 'gpu', 'gpu:0', or 'cpu'.",
+    )
+    parser.add_argument(
+        "--use-doc-preprocessor",
+        action="store_true",
+        default=None,
+        help="Enable document orientation/unwarping in PaddleX OCR pipeline.",
+    )
+    parser.add_argument(
+        "--disable-doc-preprocessor",
+        action="store_false",
+        dest="use_doc_preprocessor",
+        default=None,
+        help="Disable document orientation/unwarping in PaddleX OCR pipeline.",
+    )
+    parser.add_argument(
+        "--use-textline-orientation",
+        action="store_true",
+        default=None,
+        help="Enable textline orientation in PaddleX OCR pipeline.",
+    )
+    parser.add_argument(
+        "--disable-textline-orientation",
+        action="store_false",
+        dest="use_textline_orientation",
+        default=None,
+        help="Disable textline orientation in PaddleX OCR pipeline.",
     )
     parser.add_argument(
         "--min-score",
@@ -65,6 +96,26 @@ def configure_env(cache_dir: Path) -> None:
     os.environ["PADDLE_PDX_MODEL_SOURCE"] = "bos"
     os.environ["FLAGS_enable_pir_api"] = "0"
     os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "False"
+
+
+def build_ocr_pipeline(
+    device: str,
+    use_doc_preprocessor: bool | None,
+    use_textline_orientation: bool | None,
+):
+    from paddlex import create_pipeline
+    from paddlex.inference import load_pipeline_config
+    from paddlex.inference.utils.pp_option import PaddlePredictorOption
+
+    config = load_pipeline_config("OCR")
+    if use_doc_preprocessor is not None:
+        config["use_doc_preprocessor"] = use_doc_preprocessor
+    if use_textline_orientation is not None:
+        config["use_textline_orientation"] = use_textline_orientation
+    pp_option = PaddlePredictorOption()
+    pp_option.enable_new_ir = False
+    pp_option.enable_cinn = False
+    return create_pipeline(config=config, device=device, pp_option=pp_option)
 
 
 def load_image(path: Path) -> np.ndarray:
@@ -273,6 +324,8 @@ def run_tile_ocr(
     tile: dict,
     tile_scale: float,
     min_score: float,
+    use_doc_preprocessor: bool | None,
+    use_textline_orientation: bool | None,
 ) -> list[dict]:
     crop = image[tile["top"] : tile["bottom"], tile["left"] : tile["right"]]
     if tile_scale != 1.0:
@@ -284,7 +337,14 @@ def run_tile_ocr(
             interpolation=cv2.INTER_CUBIC,
         )
 
-    result = ocr.predict(crop, text_det_limit_side_len=max(crop.shape[:2]))
+    result = list(
+        ocr.predict(
+            crop,
+            use_doc_orientation_classify=use_doc_preprocessor,
+            use_doc_unwarping=use_doc_preprocessor,
+            use_textline_orientation=use_textline_orientation,
+        )
+    )
     rows = []
     for box, text, score in iter_ocr_results(result):
         compact = clean_text(text)
@@ -317,19 +377,11 @@ def main() -> None:
 
     configure_env(cache_dir)
 
-    from paddleocr import PaddleOCR
-
     image = load_image(image_path)
-    ocr = PaddleOCR(
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False,
-        lang=args.lang,
-        ocr_version="PP-OCRv4",
-        device="cpu",
-        enable_mkldnn=False,
-        enable_hpi=False,
-        cpu_threads=4,
+    ocr = build_ocr_pipeline(
+        device=args.device,
+        use_doc_preprocessor=args.use_doc_preprocessor,
+        use_textline_orientation=args.use_textline_orientation,
     )
 
     rows = []
@@ -342,6 +394,8 @@ def main() -> None:
                     tile=tile,
                     tile_scale=args.tile_scale,
                     min_score=args.min_score,
+                    use_doc_preprocessor=args.use_doc_preprocessor,
+                    use_textline_orientation=args.use_textline_orientation,
                 )
             )
 
